@@ -22,7 +22,6 @@ import jax
 import jax.numpy as jnp
 
 from optax._src import base
-from optax._src import clipping
 from optax._src import numerics
 from optax._src import utils
 from optax._src import wrappers
@@ -225,7 +224,12 @@ def scale_by_rms(
     eps: float = 1e-8,
     initial_scale: float = 0.
 ) -> base.GradientTransformation:
-  """Rescale updates by the root of the exp. moving avg of the square.
+  r"""Rescale updates by the root of the exp. moving avg of the square.
+
+  WARNING: PyTorch and optax's RMSprop implementations differ and could impact
+    performance. In the denominator, optax uses $\sqrt{v + \epsilon}$ whereas
+    PyTorch uses $\sqrt{v} + \epsilon$. See
+    https://github.com/google-deepmind/optax/issues/532 for more detail.
 
   References:
     [Hinton](www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf)
@@ -309,12 +313,17 @@ def scale_by_adam(
     b2: float = 0.999,
     eps: float = 1e-8,
     eps_root: float = 0.0,
-    mu_dtype: Optional[Any] = None,
+    mu_dtype: Optional[chex.ArrayDType] = None,
 ) -> base.GradientTransformation:
   """Rescale updates according to the Adam algorithm.
 
   References:
     [Kingma et al, 2014](https://arxiv.org/abs/1412.6980)
+
+  WARNING: PyTorch and optax's adam follow Algorithm 1 of the Kingma
+    and Ba's Adam paper, if reproducing old results note that TensorFlow
+    used instead the formulation just before Section 2.1 of the paper.
+    See https://github.com/deepmind/optax/issues/571 for more detail.
 
   Args:
     b1: Decay rate for the exponentially weighted average of grads.
@@ -365,7 +374,7 @@ def scale_by_amsgrad(
     b2: float = 0.999,
     eps: float = 1e-8,
     eps_root: float = 0.0,
-    mu_dtype: Optional[Any] = None,
+    mu_dtype: Optional[chex.ArrayDType] = None,
 ) -> base.GradientTransformation:
   """Rescale updates according to the AMSGrad algorithm.
 
@@ -445,6 +454,51 @@ def scale_by_adamax(
     mu_hat = bias_correction(mu, b1, count_inc)
     updates = jax.tree_util.tree_map(lambda m, v: m / v, mu_hat, nu)
     return updates, ScaleByAdamState(count=count_inc, mu=mu, nu=nu)
+
+  return base.GradientTransformation(init_fn, update_fn)
+
+
+class ScaleByLionState(NamedTuple):
+  """State for the Lion algorithm."""
+  count: chex.Array  # shape=(), dtype=jnp.int32.
+  mu: base.Updates
+
+
+def scale_by_lion(
+    b1: float = 0.9,
+    b2: float = 0.99,
+    mu_dtype: Optional[chex.ArrayDType] = None,
+) -> base.GradientTransformation:
+  """Rescale updates according to the Lion algorithm.
+
+  References:
+    [Chen et al, 2023](https://arxiv.org/abs/2302.06675)
+
+  Args:
+    b1: Rate for combining the momentum and the current grad.
+    b2: Decay rate for the exponentially weighted average of grads.
+    mu_dtype: Optional `dtype` to be used for the momentum; if
+      `None` then the `dtype is inferred from `params` and `updates`.
+
+  Returns:
+    A `GradientTransformation` object.
+  """
+
+  mu_dtype = utils.canonicalize_dtype(mu_dtype)
+
+  def init_fn(params):
+    mu = jax.tree_util.tree_map(  # moment
+        lambda t: jnp.zeros_like(t, dtype=mu_dtype), params)
+    return ScaleByLionState(count=jnp.zeros([], jnp.int32), mu=mu)
+
+  def update_fn(updates, state, params=None):
+    del params
+    updates_new = jax.tree_util.tree_map(
+        lambda g, m: jnp.sign((1. - b1) * g + b1 * m), updates, state.mu)
+    mu = update_moment(updates, state.mu, b2, 1)
+    mu = utils.cast_tree(mu, mu_dtype)
+    count_inc = numerics.safe_int32_increment(state.count)
+    return updates_new, ScaleByLionState(count=count_inc, mu=mu)
 
   return base.GradientTransformation(init_fn, update_fn)
 
@@ -698,7 +752,7 @@ AddDecayedWeightsState = base.EmptyState
 
 
 def add_decayed_weights(
-    weight_decay: float = 0.0,
+    weight_decay: Union[float, jax.Array] = 0.0,
     mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None
 ) -> base.GradientTransformation:
   """Add parameter scaled by `weight_decay`.
@@ -736,6 +790,30 @@ def add_decayed_weights(
 class ScaleByScheduleState(NamedTuple):
   """Maintains count for scale scheduling."""
   count: chex.Array  # shape=(), dtype=jnp.int32
+
+
+def scale_by_learning_rate(
+    learning_rate: base.ScalarOrSchedule,
+    *,
+    flip_sign: bool = True,
+) -> base.GradientTransformation:
+  """Scale by the (negative) learning rate (either as scalar or as schedule).
+
+  Args:
+    learning_rate: Can either be a scalar or a schedule (i.e. a callable that
+      maps an (int) step to a float).
+    flip_sign: When set to True (the default) this corresponds to scaling by the
+      negative learning rate.
+
+  Returns:
+    An optax.GradientTransformation that corresponds to multiplying the gradient
+    with `-learning_rate` (if flip_sign is True) or with `learning_rate` (if
+    flip_sign is False).
+  """
+  m = -1 if flip_sign else 1
+  if callable(learning_rate):
+    return scale_by_schedule(lambda count: m * learning_rate(count))
+  return scale(m * learning_rate)
 
 
 def scale_by_schedule(
@@ -1029,7 +1107,7 @@ def scale_by_novograd(
     eps: float = 1e-8,
     eps_root: float = 0.0,
     weight_decay: float = 0.0,
-    mu_dtype: Optional[Any] = None,
+    mu_dtype: Optional[chex.ArrayDType] = None,
 ) -> base.GradientTransformation:
   """Computes NovoGrad updates.
 
@@ -1127,12 +1205,79 @@ def scale_by_optimistic_gradient(alpha: float = 1.0,
   return base.GradientTransformation(init_fn, update_fn)
 
 
-# TODO(b/183800387): remove legacy aliases.
-# These legacy aliases are here for checkpoint compatibility
-# To be removed once checkpoints have updated.
-_safe_int32_increment = numerics.safe_int32_increment
-safe_int32_increment = numerics.safe_int32_increment
-AdditiveWeightDecayState = AddDecayedWeightsState
-additive_weight_decay = add_decayed_weights
-ClipState = clipping.ClipState
-ClipByGlobalNormState = clipping.ClipByGlobalNormState
+class ScaleByDistanceOverGradientsState(NamedTuple):
+  """State for scale_by_distance_over_gradients."""
+
+  max_dist: base.OptState
+  grad_sum_of_squares: base.OptState
+  init_params: base.OptState
+
+
+def scale_by_distance_over_gradients(
+    reps_rel=1e-6, eps=1e-8, param_dtype=jnp.float32, global_scale=1.0
+) -> base.GradientTransformation:
+  """Distance-over-gradients learning rate-free optimizer.
+
+  This implementation stores a single copy of the model parameters, plus two
+  scalars per parameter array. It is equivalent to "Layer-wise DoG" (LDoG)
+  in the paper.
+
+  The authors recommend using model averaging with this optimizer.
+
+  References:
+    ["DoG is SGD’s Best Friend: A Parameter-Free Dynamic Step Size
+    Schedule"](https://arxiv.org/pdf/2302.12022.pdf)
+
+  Args:
+    reps_rel: Used to compute initial learning rate. Recommended values are 1e-4
+      for models using batch norm, 1e-6 otherwise.
+    eps: Small loading term to avoid divide-by-zero errors.
+    param_dtype: dtype for storing initial parameters.
+    global_scale: Global scale factor, typically 1.0 or -1.0
+
+  Returns:
+    A `GradientTransformation` object.
+  """
+
+  def _l2(x, y=0.0):
+    return jnp.sqrt(jnp.square(x - y).sum())
+
+  def init_fn(params):
+    return ScaleByDistanceOverGradientsState(
+        # Initial distance (needed to prevent zero step sizes).
+        jax.tree_util.tree_map(lambda x: reps_rel * (1 + _l2(x)), params),
+        # Initial gradient sum-of-squares.
+        jax.tree_util.tree_map(lambda x: jnp.zeros(1), params),
+        # Initial params, cast to preferred precision.
+        jax.tree_map(lambda x: x.astype(param_dtype), params),
+    )
+
+  def update_fn(updates, state: ScaleByDistanceOverGradientsState, params):
+    # update max distance
+    max_dist = jax.tree_map(
+        lambda d, x, y: jnp.maximum(d, _l2(x, y)),
+        state.max_dist,
+        params,
+        state.init_params,
+    )
+
+    # update gradient sum-of-squares
+    g_sos = jax.tree_map(
+        lambda x, y: x + jnp.square(y).sum(), state.grad_sum_of_squares, updates
+    )
+
+    def _tx(g, d, g_sos):
+      """Apply the transformation."""
+      eta = global_scale * (d / jnp.sqrt(g_sos + eps))
+      return eta * g
+
+    updates = jax.tree_map(_tx, max_dist, g_sos, updates)
+
+    # new state
+    state = ScaleByDistanceOverGradientsState(
+        max_dist, g_sos, state.init_params
+    )
+
+    return updates, state
+
+  return base.GradientTransformation(init_fn, update_fn)

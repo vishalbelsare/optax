@@ -44,11 +44,13 @@ class TransformTest(parameterized.TestCase):
   @parameterized.named_parameters([
       ('adam', transform.scale_by_adam),
       ('adamax', transform.scale_by_adamax),
+      ('lion', transform.scale_by_lion),
       ('rmsprop', transform.scale_by_rms),
       ('stddev', transform.scale_by_stddev),
       ('trust_ratio', transform.scale_by_trust_ratio),
       ('param_block_norm', transform.scale_by_param_block_norm),
       ('param_block_rms', transform.scale_by_param_block_rms),
+      ('distance_over_gradients', transform.scale_by_distance_over_gradients),
   ])
   def test_scalers(self, scaler_constr):
     params = self.init_params
@@ -220,7 +222,7 @@ class TransformTest(parameterized.TestCase):
       factor = 0.1 ** i
       rescaler = transform.scale(factor)
       # Apply rescaling.
-      scaled_updates, _ = rescaler.update(updates, None)
+      scaled_updates, _ = rescaler.update(updates, {})
       # Manually scale updates.
       def rescale(t):
         return t * factor  # pylint:disable=cell-var-from-loop
@@ -239,7 +241,7 @@ class TransformTest(parameterized.TestCase):
     inputs = jnp.asarray(inputs)
     outputs = jnp.asarray(outputs)
     centralizer = transform.centralize()
-    centralized_inputs, _ = centralizer.update(inputs, None)
+    centralized_inputs, _ = centralizer.update(inputs, {})
     chex.assert_trees_all_close(centralized_inputs, outputs)
 
   @chex.all_variants
@@ -281,10 +283,10 @@ class TransformTest(parameterized.TestCase):
     og = transform.scale_by_optimistic_gradient()
     og_state = og.init(initial_params)
     # Provide some arbitrary previous gradient.
-    og_state.trace['x'] = 1.5
+    getattr(og_state, 'trace')['x'] = 1.5
 
     g = jax.grad(f)(initial_params)
-    og_true = 2 * g['x'] - og_state.trace['x']
+    og_true = 2 * g['x'] - getattr(og_state, 'trace')['x']
     og, og_state = og.update(g, og_state)
 
     # Compare transformation output with manually computed optimistic gradient.
